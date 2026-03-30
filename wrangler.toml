@@ -1,0 +1,30 @@
+name = "cerebro-auth-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Replace id after `wrangler kv namespace create OTP_KV` (or let Deploy to Cloudflare provision it).
+[[kv_namespaces]]
+binding = "OTP_KV"
+id = "3a76caaa2c9843d6ac351696dec6f2e4"
+
+[[send_email]]
+name = "send_email"
+
+[vars]
+ENVIRONMENT = "production"
+# Use your deployed worker URL after first deploy (iss must match token validation).
+JWT_ISSUER = "https://auth-worker.cerebro.work.workers.dev"
+JWT_AUDIENCE = "cerebro"
+APP_NAME = "Cerebro"
+SUPPORT_EMAIL = "support@cerebro.work"
+FROM_EMAIL = "noreply@cerebro.work"
+# Optional: comma-separated browser origins, e.g. https://app.example.com,https://localhost:5173
+# CORS_ORIGINS = ""
+# Optional: sync user + login history to a backend implementing the user-management API
+# USER_MANAGEMENT_WORKER_URL = "https://user-management.example.workers.dev"
+
+# JWT_SECRET — set with: wrangler secret put JWT_SECRET
+# Use a random string of at least 32 characters.
+
+[observability]
+enabled = true

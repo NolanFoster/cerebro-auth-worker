@@ -1,0 +1,72 @@
+{
+  "name": "cerebro-auth-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker: email OTP + JWT auth (KV, Hono, Cloudflare Email)",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "coverage": "vitest run --coverage",
+    "test:deployed": "node run-tests.js",
+    "test:all-envs": "node run-tests.js --all",
+    "deploy:test": "./deploy-and-test.sh",
+    "lint": "eslint src --ext .ts,.tsx",
+    "type-check": "tsc --noEmit",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "authentication",
+    "otp",
+    "kv"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nolanfoster/cloudflare-otp-auth-worker.git"
+  },
+  "cloudflare": {
+    "bindings": {
+      "JWT_SECRET": {
+        "description": "HS256 signing secret; use `openssl rand -hex 32` or similar. Set with `wrangler secret put JWT_SECRET`."
+      },
+      "JWT_ISSUER": {
+        "description": "JWT `iss` claim — typically your worker URL, e.g. `https://auth-worker.your-account.workers.dev`."
+      },
+      "JWT_AUDIENCE": {
+        "description": "JWT `aud` claim — your frontend or API name; must match what clients expect."
+      },
+      "FROM_EMAIL": {
+        "description": "Sender address allowed by your Cloudflare Email Routing / domain setup."
+      },
+      "USER_MANAGEMENT_WORKER_URL": {
+        "description": "Optional. If set, successful OTP verify syncs user + login history to this worker (see README)."
+      },
+      "CORS_ORIGINS": {
+        "description": "Optional. Comma-separated allowed browser origins. Leave unset for permissive CORS (dev only)."
+      }
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "@vitest/ui": "^3.2.4",
+    "eslint": "^8.57.0",
+    "miniflare": "^3.20240129.0",
+    "typescript": "^5.4.5",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.32.0"
+  },
+  "dependencies": {
+    "hono": "^4.5.0",
+    "jose": "^5.2.3"
+  }
+}
