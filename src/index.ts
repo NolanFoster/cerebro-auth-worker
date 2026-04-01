@@ -4,6 +4,7 @@ import { logger } from 'hono/logger';
 import { Env } from './types/env';
 import { storeOTP, verifyOTPForEmail, hasOTP, deleteOTP, getOTPStats } from './utils/otp-manager';
 import { EmailService } from './services/email-service';
+import { identifyUser } from './services/flaggly-service';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -202,6 +203,11 @@ app.post('/otp/verify', async (c) => {
         }
       } catch (jwtError) {
         console.error('Error generating JWT token:', jwtError);
+      }
+
+      // Fire-and-forget: identify user in Flaggly for allowed-users flag evaluation (non-blocking)
+      if (result.user_id) {
+        void identifyUser(c.env, result.user_id, email);
       }
 
       const syncUrl = c.env.USER_MANAGEMENT_WORKER_URL?.trim();

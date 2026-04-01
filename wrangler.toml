@@ -10,6 +10,12 @@ id = "3a76caaa2c9843d6ac351696dec6f2e4"
 [[send_email]]
 name = "send_email"
 
+# Optional: Flaggly feature-flag service binding (production only)
+# Comment out for environments where the flaggly worker isn't deployed.
+[[services]]
+binding = "FLAGGLY_SERVICE"
+service = "flaggly"
+
 [vars]
 ENVIRONMENT = "production"
 # Use your deployed worker URL after first deploy (iss must match token validation).
@@ -22,6 +28,10 @@ FROM_EMAIL = "noreply@cerebro.work"
 # CORS_ORIGINS = ""
 # Optional: sync user + login history to a backend implementing the user-management API
 # USER_MANAGEMENT_WORKER_URL = "https://user-management.example.workers.dev"
+
+# Optional: Flaggly integration — configure both to enable (set in Cloudflare dashboard)
+# FLAGGLY_URL = ""        # base URL for Flaggly API
+# FLAGGLY_API_KEY = ""    # use: wrangler secret put FLAGGLY_API_KEY
 
 # JWT_SECRET — set with: wrangler secret put JWT_SECRET
 # Use a random string of at least 32 characters.
