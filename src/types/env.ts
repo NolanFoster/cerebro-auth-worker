@@ -22,6 +22,13 @@ export interface Env {
   /** Comma-separated origins for CORS; omit or empty = reflect request origin (permissive). */
   CORS_ORIGINS?: string;
 
+  /** Service binding to the Flaggly worker (production). */
+  FLAGGLY_SERVICE?: Fetcher;
+  /** Base URL for Flaggly API — set in Cloudflare dashboard. */
+  FLAGGLY_URL?: string;
+  /** API key / JWT for Flaggly — set in Cloudflare dashboard or via `wrangler secret put FLAGGLY_API_KEY`. */
+  FLAGGLY_API_KEY?: string;
+
   JWT_SECRET: string;
   JWT_ISSUER: string;
   JWT_AUDIENCE: string;

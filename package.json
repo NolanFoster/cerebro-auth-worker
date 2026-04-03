@@ -66,6 +66,7 @@
     "wrangler": "^4.32.0"
   },
   "dependencies": {
+    "@flaggly/sdk": "^0.2.0",
     "hono": "^4.5.0",
     "jose": "^5.2.3"
   }
