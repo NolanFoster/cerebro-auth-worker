@@ -50,6 +50,15 @@
       },
       "CORS_ORIGINS": {
         "description": "Optional. Comma-separated allowed browser origins. Leave unset for permissive CORS (dev only)."
+      },
+      "RP_ID": {
+        "description": "WebAuthn Relying Party ID. Must be the apex of every origin in RP_ORIGINS (e.g. `cerebro.work`)."
+      },
+      "RP_NAME": {
+        "description": "Human-readable Relying Party name shown by authenticators (e.g. `Cerebro`)."
+      },
+      "RP_ORIGINS": {
+        "description": "Comma-separated list of allowed origins for WebAuthn ceremonies (e.g. `https://cerebro.work,https://app.cerebro.work`)."
       }
     }
   },
@@ -67,6 +76,7 @@
   },
   "dependencies": {
     "@flaggly/sdk": "^0.2.0",
+    "@simplewebauthn/server": "^13.3.0",
     "hono": "^4.5.0",
     "jose": "^5.2.3"
   }

@@ -27,6 +27,9 @@ describe('Health Endpoint', () => {
       JWT_SECRET: 'test-jwt-secret',
       JWT_ISSUER: 'https://auth-worker.test',
       JWT_AUDIENCE: 'test-app',
+      RP_ID: 'example.com',
+      RP_NAME: 'Example',
+      RP_ORIGINS: 'https://example.com',
       send_email: {
         send: vi.fn().mockResolvedValue(undefined)
       }
