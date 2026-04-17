@@ -13,6 +13,9 @@ const mockEnv = {
   JWT_SECRET: 'test-secret-key-for-jwt-signing-32-chars-long',
   JWT_ISSUER: 'https://auth-worker.test',
   JWT_AUDIENCE: 'test-app',
+  RP_ID: 'example.com',
+  RP_NAME: 'Example',
+  RP_ORIGINS: 'https://example.com',
   FROM_EMAIL: 'test@example.com',
   send_email: {
     send: vi.fn().mockResolvedValue(undefined)

@@ -3,10 +3,26 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { Env } from './types/env';
 import { storeOTP, verifyOTPForEmail, hasOTP, deleteOTP, getOTPStats } from './utils/otp-manager';
+import {
+  storeRegChallenge,
+  consumeRegChallenge,
+  storeAuthChallenge,
+  consumeAuthChallenge,
+  saveCredential,
+  getCredential,
+  updateCredentialCounter,
+  listUserCredentials,
+  deleteCredential,
+  type CredentialRecord,
+} from './utils/passkey-manager';
+import { PasskeyService } from './services/passkey-service';
 import { EmailService } from './services/email-service';
 import { identifyUser } from './services/flaggly-service';
+import { recordLogin } from './services/user-sync';
+import { requireAuth, type AuthVars } from './middleware/require-auth';
+import { generateSecureToken } from './utils/crypto';
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
 // Middleware
 app.use('*', logger());
@@ -210,50 +226,16 @@ app.post('/otp/verify', async (c) => {
         void identifyUser(c.env, result.user_id, email);
       }
 
-      const syncUrl = c.env.USER_MANAGEMENT_WORKER_URL?.trim();
-      if (syncUrl) {
-        try {
-          const emailHash = result.user_id;
-
-          if (!emailHash) {
-            console.error('No user_id returned from OTP verification');
-          } else {
-            const userResponse = await fetch(`${syncUrl}/users/email/${emailHash}`);
-
-            if (!userResponse.ok) {
-              const createUserResponse = await fetch(`${syncUrl}/users`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  email_hash: emailHash,
-                  account_type: 'FREE'
-                })
-              });
-
-              if (!createUserResponse.ok) {
-                console.error('Failed to create user in User Management Worker');
-              }
-            }
-
-            const loginResponse = await fetch(`${syncUrl}/login-history`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                user_id: emailHash,
-                login_method: 'OTP',
-                success: true,
-                ip_address: c.req.header('CF-Connecting-IP'),
-                user_agent: c.req.header('User-Agent')
-              })
-            });
-
-            if (!loginResponse.ok) {
-              console.error('Failed to record login history');
-            }
-          }
-        } catch (userError) {
-          console.error('Error managing user data:', userError);
-        }
+      if (result.user_id) {
+        await recordLogin(c.env, {
+          userId: result.user_id,
+          email,
+          method: 'OTP',
+          ipAddress: c.req.header('CF-Connecting-IP'),
+          userAgent: c.req.header('User-Agent'),
+        });
+      } else {
+        console.error('No user_id returned from OTP verification');
       }
 
       // Return success response with JWT token if available
@@ -519,6 +501,260 @@ app.post('/email/send-verification', async (c) => {
   }
 });
 
+// Passkey (WebAuthn) endpoints
+
+// Begin passkey registration — requires an authenticated user (OTP-issued JWT).
+app.post('/passkey/register/options', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const email = c.get('email');
+
+    const existing = await listUserCredentials(c.env.OTP_KV, userId);
+    const passkeyService = new PasskeyService(c.env);
+    const { options, challenge } = await passkeyService.generateRegistration(
+      userId,
+      email,
+      existing.map((cred) => ({ id: cred.credentialId, transports: cred.transports }))
+    );
+
+    await storeRegChallenge(c.env.OTP_KV, {
+      challenge,
+      userId,
+      email,
+      createdAt: Date.now(),
+    });
+
+    return c.json({ success: true, options });
+  } catch (error) {
+    console.error('Error generating passkey registration options:', error);
+    return c.json({ success: false, message: 'Failed to generate registration options' }, 500);
+  }
+});
+
+// Complete passkey registration — requires the same authenticated user.
+app.post('/passkey/register/verify', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const email = c.get('email');
+
+    const body = await c.req.json().catch(() => null) as
+      | { response?: unknown; name?: unknown }
+      | null;
+    if (!body || typeof body.response !== 'object' || body.response === null) {
+      return c.json({ success: false, message: 'response is required' }, 400);
+    }
+    const name = typeof body.name === 'string' && body.name.trim()
+      ? body.name.trim()
+      : `Passkey ${new Date().toISOString().slice(0, 10)}`;
+
+    const challengeRecord = await consumeRegChallenge(c.env.OTP_KV, userId);
+    if (!challengeRecord) {
+      return c.json({ success: false, message: 'Registration challenge not found or expired' }, 400);
+    }
+
+    const passkeyService = new PasskeyService(c.env);
+    const result = await passkeyService.verifyRegistration(
+      body.response as Parameters<typeof passkeyService.verifyRegistration>[0],
+      challengeRecord.challenge
+    );
+
+    if (
+      !result.verified ||
+      !result.credentialId ||
+      !result.publicKey ||
+      result.counter === undefined ||
+      !result.deviceType ||
+      result.backedUp === undefined
+    ) {
+      return c.json({ success: false, message: 'Passkey registration could not be verified' }, 400);
+    }
+
+    const record: CredentialRecord = {
+      credentialId: result.credentialId,
+      userId,
+      email,
+      publicKey: result.publicKey,
+      counter: result.counter,
+      transports: result.transports ?? [],
+      deviceType: result.deviceType,
+      backedUp: result.backedUp,
+      name,
+      createdAt: Date.now(),
+    };
+
+    await saveCredential(c.env.OTP_KV, record);
+
+    return c.json({
+      success: true,
+      message: 'Passkey registered successfully',
+      credential: {
+        credentialId: record.credentialId,
+        name: record.name,
+        createdAt: record.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error verifying passkey registration:', error);
+    return c.json({ success: false, message: 'Failed to verify passkey registration' }, 500);
+  }
+});
+
+// Begin passkey authentication (no auth required — user is proving identity).
+app.post('/passkey/authenticate/options', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({})) as { email?: unknown };
+    const email = typeof body.email === 'string' ? body.email.trim() : undefined;
+
+    let allowCredentialIds: string[] = [];
+    let allowCredentials: { id: string; transports?: CredentialRecord['transports'] }[] | undefined;
+
+    if (email) {
+      const { hashEmail } = await import('./utils/crypto');
+      const userId = await hashEmail(email);
+      const creds = await listUserCredentials(c.env.OTP_KV, userId);
+      allowCredentialIds = creds.map((cred) => cred.credentialId);
+      allowCredentials = creds.map((cred) => ({
+        id: cred.credentialId,
+        transports: cred.transports,
+      }));
+    }
+
+    const passkeyService = new PasskeyService(c.env);
+    const { options, challenge } = await passkeyService.generateAuthentication(allowCredentials);
+
+    const sessionId = generateSecureToken(16);
+    await storeAuthChallenge(c.env.OTP_KV, sessionId, {
+      challenge,
+      allowCredentialIds,
+      email,
+      createdAt: Date.now(),
+    });
+
+    return c.json({ success: true, sessionId, options });
+  } catch (error) {
+    console.error('Error generating passkey authentication options:', error);
+    return c.json({ success: false, message: 'Failed to generate authentication options' }, 500);
+  }
+});
+
+// Complete passkey authentication → returns JWT on success.
+app.post('/passkey/authenticate/verify', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => null) as
+      | { sessionId?: unknown; response?: unknown }
+      | null;
+    if (!body || typeof body.sessionId !== 'string' || typeof body.response !== 'object' || body.response === null) {
+      return c.json({ success: false, message: 'sessionId and response are required' }, 400);
+    }
+
+    const challengeRecord = await consumeAuthChallenge(c.env.OTP_KV, body.sessionId);
+    if (!challengeRecord) {
+      return c.json({ success: false, message: 'Authentication challenge not found or expired' }, 400);
+    }
+
+    const assertion = body.response as { id?: unknown };
+    if (typeof assertion.id !== 'string' || !assertion.id) {
+      return c.json({ success: false, message: 'Invalid authentication response' }, 400);
+    }
+
+    if (
+      challengeRecord.allowCredentialIds.length > 0 &&
+      !challengeRecord.allowCredentialIds.includes(assertion.id)
+    ) {
+      return c.json({ success: false, message: 'Credential not allowed for this session' }, 400);
+    }
+
+    const credential = await getCredential(c.env.OTP_KV, assertion.id);
+    if (!credential) {
+      return c.json({ success: false, message: 'Credential not found' }, 404);
+    }
+
+    const passkeyService = new PasskeyService(c.env);
+    const result = await passkeyService.verifyAuthentication(
+      body.response as Parameters<typeof passkeyService.verifyAuthentication>[0],
+      challengeRecord.challenge,
+      credential
+    );
+
+    if (!result.verified || result.newCounter === undefined) {
+      return c.json({ success: false, message: 'Passkey authentication failed' }, 401);
+    }
+
+    await updateCredentialCounter(c.env.OTP_KV, credential.credentialId, result.newCounter, Date.now());
+
+    const { JWTService } = await import('./services/jwt-service');
+    const jwtService = new JWTService(c.env);
+    const tokenResult = await jwtService.createToken(credential.userId, credential.email, 604800);
+    if (!tokenResult.success || !tokenResult.token) {
+      console.error('Failed to generate JWT token after passkey auth:', tokenResult.error);
+      return c.json({ success: false, message: 'Authentication succeeded but token issuance failed' }, 500);
+    }
+
+    void identifyUser(c.env, credential.userId, credential.email);
+    await recordLogin(c.env, {
+      userId: credential.userId,
+      email: credential.email,
+      method: 'PASSKEY',
+      ipAddress: c.req.header('CF-Connecting-IP'),
+      userAgent: c.req.header('User-Agent'),
+    });
+
+    return c.json({
+      success: true,
+      message: 'Passkey authentication successful',
+      token: tokenResult.token,
+      expiresIn: 604800,
+      user: { id: credential.userId, email: credential.email },
+    });
+  } catch (error) {
+    console.error('Error verifying passkey authentication:', error);
+    return c.json({ success: false, message: 'Failed to verify passkey authentication' }, 500);
+  }
+});
+
+// List the authenticated user's registered passkeys.
+app.get('/passkey/list', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const credentials = await listUserCredentials(c.env.OTP_KV, userId);
+    return c.json({
+      success: true,
+      credentials: credentials.map((cred) => ({
+        credentialId: cred.credentialId,
+        name: cred.name,
+        createdAt: cred.createdAt,
+        lastUsedAt: cred.lastUsedAt,
+        deviceType: cred.deviceType,
+        backedUp: cred.backedUp,
+      })),
+    });
+  } catch (error) {
+    console.error('Error listing passkeys:', error);
+    return c.json({ success: false, message: 'Failed to list passkeys' }, 500);
+  }
+});
+
+// Delete a registered passkey (owner only).
+app.delete('/passkey/:credentialId', requireAuth, async (c) => {
+  try {
+    const credentialId = c.req.param('credentialId');
+    if (!credentialId) {
+      return c.json({ success: false, message: 'credentialId is required' }, 400);
+    }
+
+    const userId = c.get('userId');
+    const deleted = await deleteCredential(c.env.OTP_KV, userId, credentialId);
+    if (!deleted) {
+      return c.json({ success: false, message: 'Passkey not found' }, 404);
+    }
+
+    return c.json({ success: true, message: 'Passkey deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting passkey:', error);
+    return c.json({ success: false, message: 'Failed to delete passkey' }, 500);
+  }
+});
+
 // Root endpoint
 app.get('/', (c) => {
   return c.json({
@@ -569,6 +805,39 @@ app.get('/', (c) => {
         method: 'POST',
         description: 'Refresh JWT',
         body: { token: 'string' }
+      },
+      {
+        path: '/passkey/register/options',
+        method: 'POST',
+        description: 'Begin passkey registration (requires Authorization: Bearer <JWT>)'
+      },
+      {
+        path: '/passkey/register/verify',
+        method: 'POST',
+        description: 'Complete passkey registration (requires Authorization: Bearer <JWT>)',
+        body: { response: 'RegistrationResponseJSON', name: 'string (optional)' }
+      },
+      {
+        path: '/passkey/authenticate/options',
+        method: 'POST',
+        description: 'Begin passkey authentication; returns sessionId + options',
+        body: { email: 'string (optional)' }
+      },
+      {
+        path: '/passkey/authenticate/verify',
+        method: 'POST',
+        description: 'Complete passkey authentication; returns JWT on success',
+        body: { sessionId: 'string', response: 'AuthenticationResponseJSON' }
+      },
+      {
+        path: '/passkey/list',
+        method: 'GET',
+        description: "List the authenticated user's passkeys (requires Authorization: Bearer <JWT>)"
+      },
+      {
+        path: '/passkey/:credentialId',
+        method: 'DELETE',
+        description: 'Delete a passkey owned by the authenticated user (requires Authorization: Bearer <JWT>)'
       }
     ]
   });

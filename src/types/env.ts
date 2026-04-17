@@ -32,4 +32,11 @@ export interface Env {
   JWT_SECRET: string;
   JWT_ISSUER: string;
   JWT_AUDIENCE: string;
+
+  /** WebAuthn Relying Party ID — must be the apex of every origin in RP_ORIGINS (e.g. "cerebro.work"). */
+  RP_ID: string;
+  /** Human-readable Relying Party name shown by authenticators (e.g. "Cerebro"). */
+  RP_NAME: string;
+  /** Comma-separated list of allowed origins for WebAuthn ceremonies (e.g. "https://app.cerebro.work,https://cerebro.work"). */
+  RP_ORIGINS: string;
 }

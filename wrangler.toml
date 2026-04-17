@@ -24,6 +24,10 @@ JWT_AUDIENCE = "cerebro"
 APP_NAME = "Cerebro"
 SUPPORT_EMAIL = "support@cerebro.work"
 FROM_EMAIL = "noreply@cerebro.work"
+# WebAuthn / passkey Relying Party config. RP_ID must be the apex of every origin in RP_ORIGINS.
+RP_ID = "cerebro.work"
+RP_NAME = "Cerebro"
+RP_ORIGINS = "https://cerebro.work,https://app.cerebro.work"
 # Optional: comma-separated browser origins, e.g. https://app.example.com,https://localhost:5173
 # CORS_ORIGINS = ""
 # Optional: sync user + login history to a backend implementing the user-management API
