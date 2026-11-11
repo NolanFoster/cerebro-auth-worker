@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import {
   storeRegChallenge,
   consumeRegChallenge,
@@ -6,7 +6,9 @@ import {
   consumeAuthChallenge,
   saveCredential,
   getCredential,
+  saveCredentialCounter,
   updateCredentialCounter,
+  listUserCredentialHints,
   listUserCredentials,
   deleteCredential,
   type CredentialRecord,
@@ -77,7 +79,7 @@ describe('passkey-manager', () => {
   });
 
   describe('registration challenges', () => {
-    it('stores and consumes a registration challenge exactly once', async () => {
+    it('stores and consumes a registration challenge exactly once, even under concurrency', async () => {
       await storeRegChallenge(kv as unknown as KVNamespace, {
         challenge: 'chal-1',
         userId: 'user-1',
@@ -85,12 +87,13 @@ describe('passkey-manager', () => {
         createdAt: Date.now(),
       });
 
-      const first = await consumeRegChallenge(kv as unknown as KVNamespace, 'user-1');
-      expect(first).not.toBeNull();
-      expect(first?.challenge).toBe('chal-1');
-
-      const second = await consumeRegChallenge(kv as unknown as KVNamespace, 'user-1');
-      expect(second).toBeNull();
+      const [first, second] = await Promise.all([
+        consumeRegChallenge(kv as unknown as KVNamespace, 'user-1'),
+        consumeRegChallenge(kv as unknown as KVNamespace, 'user-1'),
+      ]);
+      const nonNull = [first, second].filter(Boolean);
+      expect(nonNull).toHaveLength(1);
+      expect(nonNull[0]?.challenge).toBe('chal-1');
     });
 
     it('returns null for a missing challenge', async () => {
@@ -100,7 +103,7 @@ describe('passkey-manager', () => {
   });
 
   describe('authentication challenges', () => {
-    it('stores and consumes an auth challenge exactly once', async () => {
+    it('stores and consumes an auth challenge atomically under concurrent calls', async () => {
       await storeAuthChallenge(kv as unknown as KVNamespace, 'sess-1', {
         challenge: 'auth-chal',
         allowCredentialIds: ['c1'],
@@ -108,12 +111,17 @@ describe('passkey-manager', () => {
         createdAt: Date.now(),
       });
 
-      const first = await consumeAuthChallenge(kv as unknown as KVNamespace, 'sess-1');
-      expect(first?.challenge).toBe('auth-chal');
-      expect(first?.allowCredentialIds).toEqual(['c1']);
+      const [first, second] = await Promise.all([
+        consumeAuthChallenge(kv as unknown as KVNamespace, 'sess-1'),
+        consumeAuthChallenge(kv as unknown as KVNamespace, 'sess-1'),
+      ]);
+      const claimed = [first, second].filter(Boolean);
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0]?.challenge).toBe('auth-chal');
+      expect(claimed[0]?.allowCredentialIds).toEqual(['c1']);
 
-      const second = await consumeAuthChallenge(kv as unknown as KVNamespace, 'sess-1');
-      expect(second).toBeNull();
+      const third = await consumeAuthChallenge(kv as unknown as KVNamespace, 'sess-1');
+      expect(third).toBeNull();
     });
   });
 
@@ -132,6 +140,35 @@ describe('passkey-manager', () => {
       expect(list).toHaveLength(1);
     });
 
+    it('lists credential hints in a single KV read without N+1 credential lookups', async () => {
+      const credA = sampleCredential({ credentialId: 'a', transports: ['internal'] });
+      const credB = sampleCredential({ credentialId: 'b', transports: ['hybrid', 'usb'] });
+      await saveCredential(kv as unknown as KVNamespace, credA);
+      await saveCredential(kv as unknown as KVNamespace, credB);
+
+      const getSpy = vi.spyOn(kv, 'get');
+      const hints = await listUserCredentialHints(kv as unknown as KVNamespace, credA.userId);
+
+      expect(hints).toEqual([
+        { credentialId: 'a', transports: ['internal'] },
+        { credentialId: 'b', transports: ['hybrid', 'usb'] },
+      ]);
+      expect(getSpy).toHaveBeenCalledTimes(1);
+      expect(getSpy).toHaveBeenCalledWith(`pk:user:${credA.userId}:creds`);
+    });
+
+    it('falls back to reading credential records when legacy index lacks inline hints', async () => {
+      const cred = sampleCredential({ credentialId: 'legacy-1', transports: ['ble'] });
+      await (kv as unknown as KVNamespace).put(`pk:cred:${cred.credentialId}`, JSON.stringify(cred));
+      await (kv as unknown as KVNamespace).put(
+        `pk:user:${cred.userId}:creds`,
+        JSON.stringify({ credentialIds: [cred.credentialId] })
+      );
+
+      const hints = await listUserCredentialHints(kv as unknown as KVNamespace, cred.userId);
+      expect(hints).toEqual([{ credentialId: 'legacy-1', transports: ['ble'] }]);
+    });
+
     it('lists credentials for the correct user only', async () => {
       const credA = sampleCredential({ credentialId: 'a', userId: 'user-a' });
       const credB = sampleCredential({ credentialId: 'b', userId: 'user-b' });
@@ -145,23 +182,40 @@ describe('passkey-manager', () => {
     it('returns [] when the user has no credentials', async () => {
       const result = await listUserCredentials(kv as unknown as KVNamespace, 'unknown-user');
       expect(result).toEqual([]);
+      expect(await listUserCredentialHints(kv as unknown as KVNamespace, 'unknown-user')).toEqual([]);
     });
 
-    it('updates counter and lastUsedAt on successful auth', async () => {
-      const cred = sampleCredential();
-      await saveCredential(kv as unknown as KVNamespace, cred);
+    it('never regresses counter when concurrent updates arrive out of order with stale snapshots', async () => {
+      const initial = sampleCredential({ counter: 0 });
+      await saveCredential(kv as unknown as KVNamespace, initial);
+
+      // Both concurrent callers read the same initial snapshot (counter: 0),
+      // then the higher counter (2) writes before the stale lower counter (1).
+      const snapshotA = (await getCredential(kv as unknown as KVNamespace, initial.credentialId))!;
+      const snapshotB = (await getCredential(kv as unknown as KVNamespace, initial.credentialId))!;
+
+      await Promise.all([
+        saveCredentialCounter(kv as unknown as KVNamespace, snapshotA, 2, 1_700_000_002_000),
+        saveCredentialCounter(kv as unknown as KVNamespace, snapshotB, 1, 1_700_000_001_000),
+      ]);
+
+      const rawPersisted = JSON.parse(
+        (await kv.get(`pk:cred:${initial.credentialId}`))!
+      ) as CredentialRecord;
+      expect(rawPersisted.counter).toBe(2);
+      expect(rawPersisted.lastUsedAt).toBe(1_700_000_002_000);
 
       const ok = await updateCredentialCounter(
         kv as unknown as KVNamespace,
-        cred.credentialId,
+        initial.credentialId,
         42,
-        1_700_000_001_000
+        1_700_000_003_000
       );
       expect(ok).toBe(true);
 
-      const updated = await getCredential(kv as unknown as KVNamespace, cred.credentialId);
+      const updated = await getCredential(kv as unknown as KVNamespace, initial.credentialId);
       expect(updated?.counter).toBe(42);
-      expect(updated?.lastUsedAt).toBe(1_700_000_001_000);
+      expect(updated?.lastUsedAt).toBe(1_700_000_003_000);
     });
 
     it('returns false when updating counter of missing credential', async () => {
@@ -174,7 +228,7 @@ describe('passkey-manager', () => {
       expect(ok).toBe(false);
     });
 
-    it('deletes credential and removes it from the user index', async () => {
+    it('deletes credential and removes it from both user index arrays', async () => {
       const cred = sampleCredential();
       await saveCredential(kv as unknown as KVNamespace, cred);
 
@@ -187,6 +241,7 @@ describe('passkey-manager', () => {
 
       expect(await getCredential(kv as unknown as KVNamespace, cred.credentialId)).toBeNull();
       expect(await listUserCredentials(kv as unknown as KVNamespace, cred.userId)).toEqual([]);
+      expect(await listUserCredentialHints(kv as unknown as KVNamespace, cred.userId)).toEqual([]);
     });
 
     it('refuses to delete a credential owned by a different user', async () => {

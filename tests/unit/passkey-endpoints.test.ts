@@ -67,7 +67,7 @@ class MockKVNamespace {
   }
 }
 
-async function buildEnv() {
+async function buildEnv(overrides: Record<string, unknown> = {}) {
   const kv = new MockKVNamespace();
   return {
     env: {
@@ -81,6 +81,7 @@ async function buildEnv() {
       RP_ORIGINS: 'https://example.com',
       FROM_EMAIL: 'test@example.com',
       send_email: { send: vi.fn().mockResolvedValue(undefined) } as any,
+      ...overrides,
     },
     kv,
   };
@@ -102,11 +103,33 @@ describe('passkey endpoints', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }));
   });
 
+  describe('CORS preflight caching', () => {
+    it('returns Access-Control-Max-Age: 86400 on OPTIONS preflight', async () => {
+      const app = (await import('../../src/index')).default;
+      const { env } = await buildEnv({ CORS_ORIGINS: 'https://example.com' });
+
+      const res = await app.fetch(
+        new Request('http://x/passkey/authenticate/options', {
+          method: 'OPTIONS',
+          headers: {
+            Origin: 'https://example.com',
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'Content-Type',
+          },
+        }),
+        env as any
+      );
+
+      expect(res.status).toBe(204);
+      expect(res.headers.get('Access-Control-Max-Age')).toBe('86400');
+    });
+  });
+
   describe('POST /passkey/register/options', () => {
     it('requires auth', async () => {
       const app = (await import('../../src/index')).default;
       const { env } = await buildEnv();
-      const res = await app.fetch(new Request('http://x/passkey/register/options', { method: 'POST' }), env);
+      const res = await app.fetch(new Request('http://x/passkey/register/options', { method: 'POST' }), env as any);
       expect(res.status).toBe(401);
     });
 
@@ -121,7 +144,7 @@ describe('passkey endpoints', () => {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(200);
       const body = await res.json() as any;
@@ -141,7 +164,7 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: { foo: 'bar' } }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(400);
     });
@@ -156,7 +179,7 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(400);
     });
@@ -187,7 +210,7 @@ describe('passkey endpoints', () => {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
 
       const res = await app.fetch(
@@ -196,7 +219,7 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: { id: 'new-cred' }, name: 'Phone' }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(200);
       const body = await res.json() as any;
@@ -219,7 +242,7 @@ describe('passkey endpoints', () => {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
 
       const res = await app.fetch(
@@ -228,7 +251,7 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: { id: 'x' } }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(400);
     });
@@ -246,13 +269,68 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(200);
       const body = await res.json() as any;
       expect(body.sessionId).toBeTruthy();
       expect(body.options.challenge).toBe('auth-chal');
       expect(await kv.get(`pk:chal:auth:${body.sessionId}`)).toBeTruthy();
+    });
+
+    it('resolves email-scoped allowCredentials from the user index in a single KV read', async () => {
+      generateRegistrationOptions.mockResolvedValue({ challenge: 'reg-chal' });
+      verifyRegistrationResponse.mockResolvedValue({
+        verified: true,
+        registrationInfo: {
+          credential: {
+            id: 'email-cred',
+            publicKey: new Uint8Array([1, 2, 3]),
+            counter: 0,
+            transports: ['internal'],
+          },
+          credentialDeviceType: 'multiDevice',
+          credentialBackedUp: true,
+        },
+      });
+      generateAuthenticationOptions.mockResolvedValue({ challenge: 'auth-chal' });
+
+      const app = (await import('../../src/index')).default;
+      const { hashEmail } = await import('../../src/utils/crypto');
+      const email = 'hint@example.com';
+      const userId = await hashEmail(email);
+      const { env, kv } = await buildEnv();
+      const token = await bearerFor(env, userId, email);
+
+      await app.fetch(
+        new Request('http://x/passkey/register/options', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        env as any
+      );
+      await app.fetch(
+        new Request('http://x/passkey/register/verify', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ response: { id: 'email-cred' } }),
+        }),
+        env as any
+      );
+
+      const getSpy = vi.spyOn(kv, 'get');
+      const res = await app.fetch(
+        new Request('http://x/passkey/authenticate/options', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email }),
+        }),
+        env as any
+      );
+
+      expect(res.status).toBe(200);
+      expect(getSpy).toHaveBeenCalledTimes(1);
+      expect(getSpy).toHaveBeenCalledWith(`pk:user:${userId}:creds`);
     });
   });
 
@@ -266,7 +344,7 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: {} }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(400);
     });
@@ -280,9 +358,36 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId: 'nope', response: { id: 'c' } }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(400);
+    });
+
+    it('consumes challenge and rejects malformed assertion missing id', async () => {
+      generateAuthenticationOptions.mockResolvedValue({ challenge: 'auth-chal' });
+      const app = (await import('../../src/index')).default;
+      const { env, kv } = await buildEnv();
+
+      const optionsRes = await app.fetch(
+        new Request('http://x/passkey/authenticate/options', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }),
+        env as any
+      );
+      const { sessionId } = (await optionsRes.json()) as any;
+
+      const res = await app.fetch(
+        new Request('http://x/passkey/authenticate/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, response: {} }),
+        }),
+        env as any
+      );
+      expect(res.status).toBe(400);
+      expect(await kv.get(`pk:chal:auth:${sessionId}`)).toBeNull();
     });
 
     it('rejects unknown credential', async () => {
@@ -296,7 +401,7 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }),
-        env
+        env as any
       );
       const { sessionId } = (await optionsRes.json()) as any;
 
@@ -306,12 +411,12 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId, response: { id: 'does-not-exist' } }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(404);
     });
 
-    it('returns JWT on successful assertion and updates counter', async () => {
+    it('returns JWT immediately while scheduling login telemetry in waitUntil', async () => {
       generateRegistrationOptions.mockResolvedValue({ challenge: 'reg-chal' });
       verifyRegistrationResponse.mockResolvedValue({
         verified: true,
@@ -332,8 +437,16 @@ describe('passkey endpoints', () => {
         authenticationInfo: { credentialID: 'cred-happy', newCounter: 5 },
       });
 
+      let resolveSyncFetch!: (res: any) => void;
+      const slowSyncPromise = new Promise((resolve) => {
+        resolveSyncFetch = resolve;
+      });
+      vi.stubGlobal('fetch', vi.fn().mockReturnValue(slowSyncPromise));
+
       const app = (await import('../../src/index')).default;
-      const { env, kv } = await buildEnv();
+      const { env, kv } = await buildEnv({
+        USER_MANAGEMENT_WORKER_URL: 'https://ums.test',
+      });
       const token = await bearerFor(env, 'user-happy', 'happy@example.com');
 
       // Register first
@@ -342,7 +455,7 @@ describe('passkey endpoints', () => {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
       await app.fetch(
         new Request('http://x/passkey/register/verify', {
@@ -350,7 +463,7 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: { id: 'cred-happy' } }),
         }),
-        env
+        env as any
       );
 
       // Now authenticate
@@ -360,9 +473,17 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }),
-        env
+        env as any
       );
       const { sessionId } = (await optionsRes.json()) as any;
+
+      const waitUntilPromises: Promise<unknown>[] = [];
+      const executionCtx = {
+        waitUntil: vi.fn((p: Promise<unknown>) => {
+          waitUntilPromises.push(p);
+        }),
+        passThroughOnException: vi.fn(),
+      } as unknown as ExecutionContext;
 
       const verifyRes = await app.fetch(
         new Request('http://x/passkey/authenticate/verify', {
@@ -370,19 +491,95 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId, response: { id: 'cred-happy' } }),
         }),
-        env
+        env as any,
+        executionCtx
       );
+
+      // Response returned without waiting for slowSyncPromise!
       expect(verifyRes.status).toBe(200);
       const body = await verifyRes.json() as any;
       expect(body.token).toBeTruthy();
       expect(body.user.id).toBe('user-happy');
+      expect(executionCtx.waitUntil).toHaveBeenCalledTimes(1);
 
+      // Challenge consumed & counter persisted before response returned
+      expect(await kv.get(`pk:chal:auth:${sessionId}`)).toBeNull();
       const stored = JSON.parse((await kv.get('pk:cred:cred-happy'))!);
       expect(stored.counter).toBe(5);
       expect(stored.lastUsedAt).toBeGreaterThan(0);
+
+      // Let background telemetry finish cleanly
+      resolveSyncFetch({ ok: true, json: () => Promise.resolve({}) });
+      await Promise.all(waitUntilPromises);
     });
 
-    it('returns 401 when library fails to verify assertion', async () => {
+    it('rejects concurrent duplicate verification attempts for the same sessionId', async () => {
+      generateRegistrationOptions.mockResolvedValue({ challenge: 'reg-chal' });
+      verifyRegistrationResponse.mockResolvedValue({
+        verified: true,
+        registrationInfo: {
+          credential: {
+            id: 'cred-replay',
+            publicKey: new Uint8Array([1, 2, 3]),
+            counter: 0,
+            transports: ['internal'],
+          },
+          credentialDeviceType: 'multiDevice',
+          credentialBackedUp: true,
+        },
+      });
+      generateAuthenticationOptions.mockResolvedValue({ challenge: 'auth-chal' });
+      verifyAuthenticationResponse.mockResolvedValue({
+        verified: true,
+        authenticationInfo: { credentialID: 'cred-replay', newCounter: 1 },
+      });
+
+      const app = (await import('../../src/index')).default;
+      const { env } = await buildEnv();
+      const token = await bearerFor(env, 'user-replay', 'replay@example.com');
+
+      await app.fetch(
+        new Request('http://x/passkey/register/options', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        env as any
+      );
+      await app.fetch(
+        new Request('http://x/passkey/register/verify', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ response: { id: 'cred-replay' } }),
+        }),
+        env as any
+      );
+
+      const optionsRes = await app.fetch(
+        new Request('http://x/passkey/authenticate/options', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }),
+        env as any
+      );
+      const { sessionId } = (await optionsRes.json()) as any;
+
+      const makeVerifyReq = () =>
+        app.fetch(
+          new Request('http://x/passkey/authenticate/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId, response: { id: 'cred-replay' } }),
+          }),
+          env as any
+        );
+
+      const [resA, resB] = await Promise.all([makeVerifyReq(), makeVerifyReq()]);
+      const statuses = [resA.status, resB.status].sort();
+      expect(statuses).toEqual([200, 400]);
+    });
+
+    it('returns 401 when library fails to verify assertion and consumes challenge', async () => {
       generateRegistrationOptions.mockResolvedValue({ challenge: 'reg-chal' });
       verifyRegistrationResponse.mockResolvedValue({
         verified: true,
@@ -404,7 +601,7 @@ describe('passkey endpoints', () => {
       });
 
       const app = (await import('../../src/index')).default;
-      const { env } = await buildEnv();
+      const { env, kv } = await buildEnv();
       const token = await bearerFor(env, 'user-fail', 'fail@example.com');
 
       await app.fetch(
@@ -412,7 +609,7 @@ describe('passkey endpoints', () => {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
       await app.fetch(
         new Request('http://x/passkey/register/verify', {
@@ -420,7 +617,7 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: { id: 'cred-fail' } }),
         }),
-        env
+        env as any
       );
 
       const optionsRes = await app.fetch(
@@ -429,7 +626,7 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }),
-        env
+        env as any
       );
       const { sessionId } = (await optionsRes.json()) as any;
 
@@ -439,9 +636,10 @@ describe('passkey endpoints', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId, response: { id: 'cred-fail' } }),
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(401);
+      expect(await kv.get(`pk:chal:auth:${sessionId}`)).toBeNull();
     });
   });
 
@@ -449,7 +647,7 @@ describe('passkey endpoints', () => {
     it('requires auth', async () => {
       const app = (await import('../../src/index')).default;
       const { env } = await buildEnv();
-      const res = await app.fetch(new Request('http://x/passkey/list'), env);
+      const res = await app.fetch(new Request('http://x/passkey/list'), env as any);
       expect(res.status).toBe(401);
     });
 
@@ -477,7 +675,7 @@ describe('passkey endpoints', () => {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
       await app.fetch(
         new Request('http://x/passkey/register/verify', {
@@ -485,14 +683,14 @@ describe('passkey endpoints', () => {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ response: { id: 'listed-cred' }, name: 'MacBook' }),
         }),
-        env
+        env as any
       );
 
       const res = await app.fetch(
         new Request('http://x/passkey/list', {
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(200);
       const body = await res.json() as any;
@@ -511,7 +709,7 @@ describe('passkey endpoints', () => {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` },
         }),
-        env
+        env as any
       );
       expect(res.status).toBe(404);
     });

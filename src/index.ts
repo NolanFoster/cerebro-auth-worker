@@ -10,19 +10,41 @@ import {
   consumeAuthChallenge,
   saveCredential,
   getCredential,
-  updateCredentialCounter,
+  saveCredentialCounter,
+  listUserCredentialHints,
   listUserCredentials,
   deleteCredential,
   type CredentialRecord,
 } from './utils/passkey-manager';
 import { PasskeyService } from './services/passkey-service';
 import { EmailService } from './services/email-service';
+import { JWTService } from './services/jwt-service';
 import { identifyUser } from './services/flaggly-service';
 import { recordLogin } from './services/user-sync';
 import { requireAuth, type AuthVars } from './middleware/require-auth';
-import { generateSecureToken } from './utils/crypto';
+import { generateSecureToken, hashEmail } from './utils/crypto';
 
 const app = new Hono<{ Bindings: Env; Variables: AuthVars }>();
+
+/**
+ * Schedule non-blocking post-response telemetry (Flaggly identify, User
+ * Management login history) on the Worker's ExecutionContext when present.
+ * Falls back gracefully in unit tests that invoke `app.fetch(req, env)`
+ * without an ExecutionContext.
+ */
+function runInBackground(
+  c: { readonly executionCtx: ExecutionContext },
+  task: Promise<unknown>
+): void {
+  const tracked = task.catch((error) => {
+    console.error('Background task error:', error);
+  });
+  try {
+    c.executionCtx.waitUntil(tracked);
+  } catch {
+    // Unit tests without an ExecutionContext still run the promise detached.
+  }
+}
 
 // Middleware
 app.use('*', logger());
@@ -31,6 +53,7 @@ app.use('*', (c, next) => {
   const allowList = raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
   return cors({
     origin: allowList.length > 0 ? allowList : (origin) => origin || '*',
+    maxAge: 86400,
   })(c, next);
 });
 
@@ -203,7 +226,6 @@ app.post('/otp/verify', async (c) => {
       let jwtToken = null;
       try {
         if (result.user_id) {
-          const { JWTService } = await import('./services/jwt-service');
           const jwtService = new JWTService(c.env);
           
           // Create token with 7 day expiration
@@ -221,19 +243,22 @@ app.post('/otp/verify', async (c) => {
         console.error('Error generating JWT token:', jwtError);
       }
 
-      // Fire-and-forget: identify user in Flaggly for allowed-users flag evaluation (non-blocking)
       if (result.user_id) {
-        void identifyUser(c.env, result.user_id, email);
-      }
-
-      if (result.user_id) {
-        await recordLogin(c.env, {
-          userId: result.user_id,
-          email,
-          method: 'OTP',
-          ipAddress: c.req.header('CF-Connecting-IP'),
-          userAgent: c.req.header('User-Agent'),
-        });
+        const ipAddress = c.req.header('CF-Connecting-IP');
+        const userAgent = c.req.header('User-Agent');
+        runInBackground(
+          c,
+          Promise.all([
+            identifyUser(c.env, result.user_id, email),
+            recordLogin(c.env, {
+              userId: result.user_id,
+              email,
+              method: 'OTP',
+              ipAddress,
+              userAgent,
+            }),
+          ])
+        );
       } else {
         console.error('No user_id returned from OTP verification');
       }
@@ -289,7 +314,6 @@ app.post('/auth/refresh', async (c) => {
     }
 
     try {
-      const { JWTService } = await import('./services/jwt-service');
       const jwtService = new JWTService(c.env);
       
       // Verify the existing token
@@ -356,7 +380,6 @@ app.post('/auth/validate', async (c) => {
     }
 
     try {
-      const { JWTService } = await import('./services/jwt-service');
       const jwtService = new JWTService(c.env);
       
       const result = await jwtService.verifyToken(token);
@@ -509,7 +532,7 @@ app.post('/passkey/register/options', requireAuth, async (c) => {
     const userId = c.get('userId');
     const email = c.get('email');
 
-    const existing = await listUserCredentials(c.env.OTP_KV, userId);
+    const existing = await listUserCredentialHints(c.env.OTP_KV, userId);
     const passkeyService = new PasskeyService(c.env);
     const { options, challenge } = await passkeyService.generateRegistration(
       userId,
@@ -609,9 +632,8 @@ app.post('/passkey/authenticate/options', async (c) => {
     let allowCredentials: { id: string; transports?: CredentialRecord['transports'] }[] | undefined;
 
     if (email) {
-      const { hashEmail } = await import('./utils/crypto');
       const userId = await hashEmail(email);
-      const creds = await listUserCredentials(c.env.OTP_KV, userId);
+      const creds = await listUserCredentialHints(c.env.OTP_KV, userId);
       allowCredentialIds = creds.map((cred) => cred.credentialId);
       allowCredentials = creds.map((cred) => ({
         id: cred.credentialId,
@@ -647,24 +669,31 @@ app.post('/passkey/authenticate/verify', async (c) => {
       return c.json({ success: false, message: 'sessionId and response are required' }, 400);
     }
 
-    const challengeRecord = await consumeAuthChallenge(c.env.OTP_KV, body.sessionId);
+    const assertion = body.response as { id?: unknown };
+    const credentialId = typeof assertion.id === 'string' && assertion.id ? assertion.id : null;
+
+    // Atomically claim + consume the single-use challenge while fetching the
+    // credential record in parallel so KV lookups do not serialize.
+    const [challengeRecord, credential] = await Promise.all([
+      consumeAuthChallenge(c.env.OTP_KV, body.sessionId),
+      credentialId ? getCredential(c.env.OTP_KV, credentialId) : Promise.resolve(null),
+    ]);
+
     if (!challengeRecord) {
       return c.json({ success: false, message: 'Authentication challenge not found or expired' }, 400);
     }
 
-    const assertion = body.response as { id?: unknown };
-    if (typeof assertion.id !== 'string' || !assertion.id) {
+    if (!credentialId) {
       return c.json({ success: false, message: 'Invalid authentication response' }, 400);
     }
 
     if (
       challengeRecord.allowCredentialIds.length > 0 &&
-      !challengeRecord.allowCredentialIds.includes(assertion.id)
+      !challengeRecord.allowCredentialIds.includes(credentialId)
     ) {
       return c.json({ success: false, message: 'Credential not allowed for this session' }, 400);
     }
 
-    const credential = await getCredential(c.env.OTP_KV, assertion.id);
     if (!credential) {
       return c.json({ success: false, message: 'Credential not found' }, 404);
     }
@@ -680,24 +709,32 @@ app.post('/passkey/authenticate/verify', async (c) => {
       return c.json({ success: false, message: 'Passkey authentication failed' }, 401);
     }
 
-    await updateCredentialCounter(c.env.OTP_KV, credential.credentialId, result.newCounter, Date.now());
-
-    const { JWTService } = await import('./services/jwt-service');
     const jwtService = new JWTService(c.env);
-    const tokenResult = await jwtService.createToken(credential.userId, credential.email, 604800);
+    const [, tokenResult] = await Promise.all([
+      saveCredentialCounter(c.env.OTP_KV, credential, result.newCounter, Date.now()),
+      jwtService.createToken(credential.userId, credential.email, 604800),
+    ]);
+
     if (!tokenResult.success || !tokenResult.token) {
       console.error('Failed to generate JWT token after passkey auth:', tokenResult.error);
       return c.json({ success: false, message: 'Authentication succeeded but token issuance failed' }, 500);
     }
 
-    void identifyUser(c.env, credential.userId, credential.email);
-    await recordLogin(c.env, {
-      userId: credential.userId,
-      email: credential.email,
-      method: 'PASSKEY',
-      ipAddress: c.req.header('CF-Connecting-IP'),
-      userAgent: c.req.header('User-Agent'),
-    });
+    const ipAddress = c.req.header('CF-Connecting-IP');
+    const userAgent = c.req.header('User-Agent');
+    runInBackground(
+      c,
+      Promise.all([
+        identifyUser(c.env, credential.userId, credential.email),
+        recordLogin(c.env, {
+          userId: credential.userId,
+          email: credential.email,
+          method: 'PASSKEY',
+          ipAddress,
+          userAgent,
+        }),
+      ])
+    );
 
     return c.json({
       success: true,
